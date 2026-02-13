@@ -561,6 +561,7 @@ class SubGroupLoader(Dataset):
       
 class SubGroupLoader3D(GroupDataLoader3D):
     def __init__(self, data: list[list[str]], segmentations: list[list[str]]=None, 
+                 mesh_paths: Optional[list[list[str]]]=None,
                  labels: Optional[list[int]]=None,
                  file_names: Optional[list[str]] = None,
                  dataset_name : str = 'oasis',
@@ -580,6 +581,7 @@ class SubGroupLoader3D(GroupDataLoader3D):
         self.data = data
         self.labels = labels
         self.segmentations = segmentations
+        self.mesh_paths = mesh_paths
         self.file_names = file_names
         self.transform = transform
         self.dataset_name = dataset_name
@@ -596,7 +598,13 @@ class SubGroupLoader3D(GroupDataLoader3D):
             if not isinstance(self.segmentations, list):
                 raise ValueError("Segmentations should be a list of lists of strings pointing to segmentations.")
             if isinstance(self.segmentations, list) and len(self.segmentations) > 1:
-                self.segmentations = [self.segmentations]    
+                self.segmentations = [self.segmentations]   
+
+        if self.mesh_paths is not None:
+            if not isinstance(self.mesh_paths, list):
+                raise ValueError("Mesh paths should be a list of lists of strings pointing to meshes.")
+            if isinstance(self.mesh_paths, list) and len(self.mesh_paths) > 1:
+                self.mesh_paths = [self.mesh_paths] 
         
         self.img_size = self._get_img_size()
 
@@ -615,16 +623,53 @@ class SubGroupLoader3D(GroupDataLoader3D):
     def load_multiple_segmentations(self, img_list, idx_list):
         return super().load_multiple_segmentations(img_list, idx_list)
     
+    def load_mesh(self, mesh_path: str):
+        """
+        Loads mesh and returns vertices and faces. 
+
+        Returns:
+            verts: tensor of shape (n_verts, 3)
+            faces: tensor of shape (n_faces, 3)
+        """
+        import trimesh
+
+        mesh = trimesh.load(mesh_path, process=False)
+        verts = torch.from_numpy(mesh.vertices).float()
+        faces = torch.from_numpy(mesh.faces).long()
+        return verts, faces
+    
+    def load_multiple_meshes(self, mesh_list, idx_list):
+        """
+        Loads multiple meshes. Can't have faces that don't match since we need correspondence.
+        
+        Returns:
+            verts_stack: tensor of shape (num_meshes, n_verts, 3)
+            faces_ref: tensor of shape (n_faces, 3)
+        """
+        verts_list = []
+        faces_ref = None
+        for idx in idx_list:
+            verts, faces = self.load_mesh(mesh_list[idx])
+            if faces_ref is None:
+                faces_ref = faces
+            else:
+                if faces.shape != faces_ref.shape or not torch.equal(faces, faces_ref):
+                    raise ValueError("Mesh faces don't mathch (Necessary for correspondence).")
+            verts_list.append(verts)
+        return torch.stack(verts_list, dim=0), faces_ref
+    
     def __getitem__(self, idx):
         images = self.data[idx]
         segmentations = self.segmentations[idx] if self.segmentations is not None else []
         file_names = self.file_names[idx] if self.file_names is not None else []
+        mesh_paths = self.mesh_paths[idx] if self.mesh_paths is not None else []
         
         n_images = len(images) if not self.load_batch else 1
         if self.load_batch:
             file_names = images.split('/')[-2]
             images = [images]
             segmentations = [segmentations]
+            mesh_paths = [mesh_paths]
         
         images = self.load_multiple_imgs(images, range(0,n_images))
         # check if uint8
@@ -642,6 +687,11 @@ class SubGroupLoader3D(GroupDataLoader3D):
                 segmentations = self.segmentation_to_one_hot(segmentations, num_classes=-1).to(torch.float)
         else:
             segmentations = torch.zeros_like(images)
+
+        if self.mesh_paths is not None:
+            mesh_verts, mesh_faces = self.load_multiple_meshes(mesh_paths, range(0, n_images))
+        else:
+            mesh_verts, mesh_faces = None, None
         
         #images = torch.permute(images,(1,0,*range(2,images.dim())))
         #for mnist, we want the images to be (N,C,H,W,D).
@@ -657,7 +707,10 @@ class SubGroupLoader3D(GroupDataLoader3D):
             segmentations = self.transform(segmentations) if segmentations is not None else None
             
         sample = {'image':images, 'label': labels, 'segmentation': segmentations, 'file_name': file_names}
-        
+        if self.mesh_paths is not None:
+            sample['mesh_verts'] = mesh_verts
+            sample['mesh_faces'] = mesh_faces
+
         return sample
         
     def __len__(self):
